@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+<<<<<<< HEAD
 端口扫描工具 - GUI版本（支持批量扫描 + 子网掩码计算）
 用途：图形化界面的端口扫描工具，支持批量IP扫描和子网掩码计算
+=======
+端口扫描工具 - GUI版本（支持批量扫描）
+用途：图形化界面的端口扫描工具，支持批量IP扫描
+>>>>>>> 39f10c98347995b7e19ae3bb86943b0b75dfcc66
 """
 
 import socket
@@ -19,6 +24,7 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 
 
+<<<<<<< HEAD
 class SubnetCalculator:
     """子网掩码计算器类"""
     
@@ -170,6 +176,8 @@ class SubnetCalculator:
             raise ValueError(f"无效的CIDR格式或前缀长度: {e}")
 
 
+=======
+>>>>>>> 39f10c98347995b7e19ae3bb86943b0b75dfcc66
 class PortScanner:
     def __init__(self, target, start_port=1, end_port=1024, threads=100, 
                  progress_callback=None, result_callback=None, custom_ports=None,
@@ -348,6 +356,7 @@ def parse_ip_input(ip_input):
     return ip_list
 
 
+<<<<<<< HEAD
 class SubnetCalculatorGUI:
     """子网掩码计算器GUI"""
     
@@ -578,6 +587,14 @@ class PortScannerGUI:
             self.root.title("NetKit - 网络工具箱")
             self.root.geometry("900x700")
             self.root.minsize(800, 600)
+=======
+class PortScannerGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("端口扫描工具 - 批量扫描版")
+        self.root.geometry("800x650")
+        self.root.minsize(700, 500)
+>>>>>>> 39f10c98347995b7e19ae3bb86943b0b75dfcc66
         
         # 设置样式
         self.style = ttk.Style()
@@ -593,9 +610,13 @@ class PortScannerGUI:
         self.ping_results = {}  # 存储ping结果
         
         self.create_widgets()
+<<<<<<< HEAD
         
         if not embedded:
             self.center_window()
+=======
+        self.center_window()
+>>>>>>> 39f10c98347995b7e19ae3bb86943b0b75dfcc66
     
     def center_window(self):
         """窗口居中"""
@@ -769,9 +790,14 @@ class PortScannerGUI:
         )
         self.result_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
+<<<<<<< HEAD
         # 绑定关闭事件（仅在非嵌入模式下）
         if not self.embedded:
             self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+=======
+        # 绑定关闭事件
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+>>>>>>> 39f10c98347995b7e19ae3bb86943b0b75dfcc66
     
     def load_ip_file(self):
         """加载IP文件"""
@@ -845,6 +871,7 @@ class PortScannerGUI:
         
         total_open = sum(len(ports) for ports in results.values())
         
+<<<<<<< HEAD
         # 清空并显示简洁结果
         self.result_text.delete(1.0, tk.END)
         
@@ -868,10 +895,30 @@ class PortScannerGUI:
         
         self.result_text.insert(tk.END, f"\n{'─' * 40}\n")
         self.result_text.insert(tk.END, f"⏱ 耗时: {duration:.2f} 秒 | 🌐 IP数: {len(results)} | 🔌 端口: {total_open}")
+=======
+        self.log("=" * 60)
+        self.log(f"扫描完成！总耗时: {duration:.2f} 秒")
+        self.log(f"扫描IP数: {len(results)}")
+        self.log(f"发现开放端口总数: {total_open}")
+        
+        if total_open > 0:
+            self.log("\n[+] 详细结果汇总:")
+            for ip, ports in results.items():
+                if ports:
+                    self.log(f"\n  {ip}:")
+                    for port, service in sorted(ports):
+                        self.log(f"    {port}/tcp - {service}")
+>>>>>>> 39f10c98347995b7e19ae3bb86943b0b75dfcc66
         
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.current_ip_label.config(text="当前扫描: -")
+<<<<<<< HEAD
+=======
+        
+        messagebox.showinfo("扫描完成", 
+                           f"扫描完成！\n扫描IP数: {len(results)}\n发现开放端口: {total_open}\n耗时: {duration:.2f} 秒")
+>>>>>>> 39f10c98347995b7e19ae3bb86943b0b75dfcc66
     
     def start_scan(self):
         """开始批量扫描"""
@@ -1091,6 +1138,7 @@ class PortScannerGUI:
     
     def on_closing(self):
         """关闭窗口"""
+<<<<<<< HEAD
         if not self.embedded:
             if self.scanning:
                 if messagebox.askokcancel("确认", "扫描正在进行中，确定要退出吗？"):
@@ -1133,10 +1181,24 @@ def main():
     y = (root.winfo_screenheight() // 2) - (height // 2)
     root.geometry(f'{width}x{height}+{x}+{y}')
     
+=======
+        if self.scanning:
+            if messagebox.askokcancel("确认", "扫描正在进行中，确定要退出吗？"):
+                self.scanning = False
+                self.root.destroy()
+        else:
+            self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    app = PortScannerGUI(root)
+>>>>>>> 39f10c98347995b7e19ae3bb86943b0b75dfcc66
     root.mainloop()
 
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     try:
         main()
     except Exception as e:
@@ -1152,3 +1214,6 @@ if __name__ == "__main__":
         except:
             print(error_msg)
         input("\n按回车键退出...")
+=======
+    main()
+>>>>>>> 39f10c98347995b7e19ae3bb86943b0b75dfcc66
