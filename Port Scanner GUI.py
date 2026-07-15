@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 NetKit - 网络工具箱
-端口扫描工具 - GUI版本（支持批量扫描 + 子网掩码计算 + Nmap扫描）
+端口扫描工具 - GUI版本（支持批量扫描 + 子网掩码计算 + Nmap扫描 + IP归属地查询）
 """
 
 import socket
@@ -13,6 +13,9 @@ import re
 import os
 import platform
 import subprocess
+import json
+import urllib.request
+import urllib.error
 from queue import Queue
 from datetime import datetime
 import tkinter as tk
@@ -970,6 +973,552 @@ class ScanResultsGUI:
         self.results_data = {}
 
 
+class IPGeolocationGUI:
+    """IP归属地查询 - 通过多个公开API查询IP的地理位置和ISP信息"""
+
+    APIS = [
+        {
+            'name': 'ip-api.com',
+            'url': 'http://ip-api.com/json/{ip}?lang=zh-CN',
+            'parse': lambda data: {
+                'ip': data.get('query', '-'),
+                '国家': data.get('country', '-'),
+                '地区/省': data.get('regionName', '-'),
+                '城市': data.get('city', '-'),
+                '区县': data.get('district', '-') or '-',
+                'ISP/运营商': data.get('isp', '-'),
+                '组织': data.get('org', '-'),
+                'AS号': data.get('as', '-'),
+                '时区': data.get('timezone', '-'),
+                '纬度': str(data.get('lat', '-')),
+                '经度': str(data.get('lon', '-')),
+                '邮编': data.get('zip', '-'),
+            }
+        },
+        {
+            'name': 'ipapi.co',
+            'url': 'https://ipapi.co/{ip}/json/',
+            'parse': lambda data: {
+                'ip': data.get('ip', '-'),
+                '国家': data.get('country_name', '-'),
+                '地区/省': data.get('region', '-'),
+                '城市': data.get('city', '-'),
+                '区县': data.get('district', '-') or '-',
+                'ISP/运营商': data.get('org', '-'),
+                '组织': data.get('org', '-'),
+                'AS号': data.get('asn', '-'),
+                '时区': data.get('timezone', '-'),
+                '纬度': str(data.get('latitude', '-')),
+                '经度': str(data.get('longitude', '-')),
+                '邮编': data.get('postal', '-'),
+            }
+        },
+        {
+            'name': '淘宝IP库',
+            'url': 'https://ip.taobao.com/service/getIpInfo.php?ip={ip}',
+            'parse': lambda data: {
+                'ip': (data.get('data') or {}).get('ip', '-'),
+                '国家': (data.get('data') or {}).get('country', '-'),
+                '地区/省': (data.get('data') or {}).get('region', '-'),
+                '城市': (data.get('data') or {}).get('city', '-'),
+                '区县': (data.get('data') or {}).get('area', '-'),
+                'ISP/运营商': (data.get('data') or {}).get('isp', '-'),
+                '组织': (data.get('data') or {}).get('isp', '-'),
+                'AS号': '-',
+                '时区': '-',
+                '纬度': '-',
+                '经度': '-',
+                '邮编': '-',
+            }
+        }
+    ]
+
+    def __init__(self, parent):
+        self.frame = ttk.Frame(parent, padding="10")
+        self.frame.pack(fill=tk.BOTH, expand=True)
+        self.history = []
+        self.cache = {}
+        self.cache_ttl = 3600
+        self.busy = False
+        self.local_ip = self._get_local_ip()
+        self.create_widgets()
+
+    def _get_local_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(1)
+            s.connect(("223.5.5.5", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            try:
+                return socket.gethostbyname(socket.gethostname())
+            except Exception:
+                return "127.0.0.1"
+
+    def _resolve_domain(self, domain):
+        try:
+            return socket.gethostbyname(domain)
+        except Exception as e:
+            raise ValueError(f"域名解析失败: {e}")
+
+    def _query_api(self, api, ip):
+        url = api['url'].format(ip=ip)
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (NetKit IP Geolocation Tool)',
+            'Accept': 'application/json',
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode('utf-8', errors='ignore')
+        data = json.loads(raw)
+        return api['parse'](data), api['name']
+
+    def _is_private_ip(self, ip):
+        try:
+            return ipaddress.ip_address(ip).is_private
+        except Exception:
+            return False
+
+    def lookup(self, ip_input, use_cache=True):
+        if not ip_input or not ip_input.strip():
+            raise ValueError("请输入有效的IP或域名")
+        ip_input = ip_input.strip()
+        try:
+            ipaddress.ip_address(ip_input)
+            is_ip = True
+        except ValueError:
+            is_ip = False
+        if not is_ip:
+            resolved = self._resolve_domain(ip_input)
+            ip = resolved
+            display_target = f"{ip_input} -> {ip}"
+        else:
+            ip = ip_input
+            display_target = ip
+        if self._is_private_ip(ip):
+            return {
+                '_target': display_target, '_ip': ip, '_source': '本地',
+                '国家': '本地网络', '地区/省': '-', '城市': '-', '区县': '-',
+                'ISP/运营商': '局域网/私有地址', '组织': '-', 'AS号': '-',
+                '时区': '-', '纬度': '-', '经度': '-', '邮编': '-',
+            }
+        if use_cache and ip in self.cache:
+            cached, ts = self.cache[ip]
+            if time.time() - ts < self.cache_ttl:
+                result = dict(cached)
+                result['_target'] = display_target
+                result['_cached'] = True
+                return result
+        last_err = None
+        for api in self.APIS:
+            try:
+                result, source = self._query_api(api, ip)
+                result['_target'] = display_target
+                result['_ip'] = ip
+                result['_source'] = source
+                self.cache[ip] = (dict(result), time.time())
+                return result
+            except Exception as e:
+                last_err = e
+                continue
+        raise RuntimeError(f"所有API均查询失败: {last_err}")
+
+    def get_my_public_ip(self):
+        urls = [
+            'https://api.ipify.org?format=json',
+            'https://ifconfig.me/all.json',
+            'https://ipinfo.io/json',
+        ]
+        for url in urls:
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode('utf-8', errors='ignore'))
+                if 'ip' in data: return data['ip']
+                if 'origin' in data: return data['origin']
+                if 'ip_addr' in data: return data['ip_addr']
+            except Exception:
+                continue
+        return None
+
+    def create_widgets(self):
+        input_frame = ttk.LabelFrame(self.frame, text="IP / 域名 查询", padding="10")
+        input_frame.pack(fill=tk.X, pady=5)
+        input_frame.columnconfigure(1, weight=1)
+        ttk.Label(input_frame, text="目标:", width=10).grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.ip_entry = ttk.Entry(input_frame, width=50, font=('Consolas', 10))
+        self.ip_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
+        self.ip_entry.insert(0, "8.8.8.8")
+        self.ip_entry.bind('<Return>', lambda e: self.single_lookup())
+        btn_frame = ttk.Frame(input_frame)
+        btn_frame.grid(row=0, column=2, padx=5)
+        self.query_btn = ttk.Button(btn_frame, text="查询", command=self.single_lookup, width=10)
+        self.query_btn.pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="清空", command=self.clear_single, width=8).pack(side=tk.LEFT, padx=2)
+        quick_frame = ttk.Frame(input_frame)
+        quick_frame.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        ttk.Label(quick_frame, text="快捷:", foreground='gray').pack(side=tk.LEFT, padx=5)
+        ttk.Button(quick_frame, text="我的公网IP", command=self.lookup_my_ip, width=15).pack(side=tk.LEFT, padx=2)
+        ttk.Button(quick_frame, text="本机内网IP", command=self.lookup_local_ip, width=15).pack(side=tk.LEFT, padx=2)
+        ttk.Button(quick_frame, text="百度", command=lambda: self._quick_set("baidu.com"), width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(quick_frame, text="谷歌", command=lambda: self._quick_set("google.com"), width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(quick_frame, text="GitHub", command=lambda: self._quick_set("github.com"), width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(quick_frame, text="114DNS", command=lambda: self._quick_set("114.114.114.114"), width=8).pack(side=tk.LEFT, padx=2)
+        hint_label = ttk.Label(input_frame, text="支持单个IP、域名 (如 8.8.8.8 / baidu.com)", foreground='gray', font=('微软雅黑', 8))
+        hint_label.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=5, pady=(5, 0))
+        self.status_label = ttk.Label(self.frame, text="就绪", foreground='gray', font=('Consolas', 9))
+        self.status_label.pack(anchor=tk.W, padx=5, pady=2)
+        self.inner_notebook = ttk.Notebook(self.frame)
+        self.inner_notebook.pack(fill=tk.BOTH, expand=True, pady=5)
+        single_frame = ttk.Frame(self.inner_notebook, padding="5")
+        self.inner_notebook.add(single_frame, text="详细信息")
+        single_frame.columnconfigure(0, weight=1)
+        single_frame.rowconfigure(0, weight=1)
+        detail_tree_frame = ttk.Frame(single_frame)
+        detail_tree_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        detail_tree_frame.columnconfigure(0, weight=1)
+        detail_tree_frame.rowconfigure(0, weight=1)
+        self.detail_tree = ttk.Treeview(detail_tree_frame, columns=('field', 'value'), show='headings', height=14)
+        self.detail_tree.heading('field', text='字段')
+        self.detail_tree.heading('value', text='值')
+        self.detail_tree.column('field', width=160, anchor=tk.W)
+        self.detail_tree.column('value', width=500, anchor=tk.W)
+        ds_y = ttk.Scrollbar(detail_tree_frame, orient=tk.VERTICAL, command=self.detail_tree.yview)
+        self.detail_tree.configure(yscrollcommand=ds_y.set)
+        self.detail_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        ds_y.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        map_frame = ttk.Frame(single_frame)
+        map_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
+        ttk.Label(map_frame, text="地图查看:", font=('微软雅黑', 9)).pack(side=tk.LEFT, padx=5)
+        self.map_link_label = ttk.Label(map_frame, text="(查询后显示)", foreground='blue', cursor='hand2', font=('Consolas', 9))
+        self.map_link_label.pack(side=tk.LEFT, padx=5)
+        ttk.Button(map_frame, text="打开地图", command=self.open_map, width=10).pack(side=tk.LEFT, padx=5)
+        batch_frame = ttk.Frame(self.inner_notebook, padding="5")
+        self.inner_notebook.add(batch_frame, text="批量查询")
+        batch_frame.columnconfigure(0, weight=1)
+        batch_frame.rowconfigure(1, weight=1)
+        batch_input_frame = ttk.Frame(batch_frame)
+        batch_input_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
+        batch_input_frame.columnconfigure(0, weight=1)
+        ttk.Label(batch_input_frame, text="输入多个IP/域名（每行一个）:").grid(row=0, column=0, sticky=tk.W)
+        self.batch_text = scrolledtext.ScrolledText(batch_input_frame, height=6, font=('Consolas', 10), wrap=tk.WORD)
+        self.batch_text.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=3)
+        self.batch_text.insert(tk.END, "8.8.8.8\n1.1.1.1\n114.114.114.114\nbaidu.com\ngithub.com")
+        batch_btn_frame = ttk.Frame(batch_input_frame)
+        batch_btn_frame.grid(row=2, column=0, sticky=tk.W, pady=3)
+        self.batch_btn = ttk.Button(batch_btn_frame, text="开始批量查询", command=self.batch_lookup, width=18)
+        self.batch_btn.pack(side=tk.LEFT, padx=2)
+        ttk.Button(batch_btn_frame, text="清空", command=lambda: self.batch_text.delete('1.0', tk.END), width=8).pack(side=tk.LEFT, padx=2)
+        self.batch_progress = ttk.Progressbar(batch_input_frame, mode='determinate', length=400)
+        self.batch_progress.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=3)
+        batch_result_frame = ttk.Frame(batch_frame)
+        batch_result_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        batch_result_frame.columnconfigure(0, weight=1)
+        batch_result_frame.rowconfigure(0, weight=1)
+        cols = ('目标', 'IP', '国家', '地区/省', '城市', 'ISP/运营商', '数据源')
+        self.batch_tree = ttk.Treeview(batch_result_frame, columns=cols, show='headings', height=10)
+        for c in cols: self.batch_tree.heading(c, text=c)
+        self.batch_tree.column('目标', width=180, anchor=tk.W)
+        self.batch_tree.column('IP', width=130, anchor=tk.W)
+        self.batch_tree.column('国家', width=90, anchor=tk.W)
+        self.batch_tree.column('地区/省', width=110, anchor=tk.W)
+        self.batch_tree.column('城市', width=100, anchor=tk.W)
+        self.batch_tree.column('ISP/运营商', width=180, anchor=tk.W)
+        self.batch_tree.column('数据源', width=110, anchor=tk.W)
+        bs_y = ttk.Scrollbar(batch_result_frame, orient=tk.VERTICAL, command=self.batch_tree.yview)
+        bs_x = ttk.Scrollbar(batch_result_frame, orient=tk.HORIZONTAL, command=self.batch_tree.xview)
+        self.batch_tree.configure(yscrollcommand=bs_y.set, xscrollcommand=bs_x.set)
+        self.batch_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        bs_y.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        bs_x.grid(row=1, column=0, sticky=(tk.W, tk.E))
+        history_frame = ttk.Frame(self.inner_notebook, padding="5")
+        self.inner_notebook.add(history_frame, text="查询历史")
+        history_frame.columnconfigure(0, weight=1)
+        history_frame.rowconfigure(0, weight=1)
+        hist_tree_frame = ttk.Frame(history_frame)
+        hist_tree_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        hist_tree_frame.columnconfigure(0, weight=1)
+        hist_tree_frame.rowconfigure(0, weight=1)
+        hist_cols = ('时间', '目标', 'IP', '国家', '城市', 'ISP')
+        self.history_tree = ttk.Treeview(hist_tree_frame, columns=hist_cols, show='headings', height=12)
+        for c in hist_cols: self.history_tree.heading(c, text=c)
+        self.history_tree.column('时间', width=140, anchor=tk.W)
+        self.history_tree.column('目标', width=160, anchor=tk.W)
+        self.history_tree.column('IP', width=120, anchor=tk.W)
+        self.history_tree.column('国家', width=80, anchor=tk.W)
+        self.history_tree.column('城市', width=100, anchor=tk.W)
+        self.history_tree.column('ISP', width=200, anchor=tk.W)
+        hs_y = ttk.Scrollbar(hist_tree_frame, orient=tk.VERTICAL, command=self.history_tree.yview)
+        self.history_tree.configure(yscrollcommand=hs_y.set)
+        self.history_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        hs_y.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.history_tree.bind('<Double-1>', lambda e: self.relookup_selected())
+        hist_btn_frame = ttk.Frame(history_frame)
+        hist_btn_frame.grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Button(hist_btn_frame, text="重新查询选中", command=self.relookup_selected, width=15).pack(side=tk.LEFT, padx=2)
+        ttk.Button(hist_btn_frame, text="清空历史", command=self.clear_history, width=12).pack(side=tk.LEFT, padx=2)
+        bottom_frame = ttk.Frame(self.frame)
+        bottom_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(bottom_frame, text="导出结果", command=self.export_results, width=12).pack(side=tk.LEFT, padx=3)
+        ttk.Button(bottom_frame, text="复制详情", command=self.copy_detail, width=12).pack(side=tk.LEFT, padx=3)
+        ttk.Button(bottom_frame, text="清空全部", command=self.clear_all, width=12).pack(side=tk.LEFT, padx=3)
+        ttk.Label(bottom_frame, text=f"本机IP: {self.local_ip}", foreground='gray', font=('Consolas', 9)).pack(side=tk.RIGHT, padx=5)
+
+    def _quick_set(self, value):
+        self.ip_entry.delete(0, tk.END)
+        self.ip_entry.insert(0, value)
+
+    def single_lookup(self):
+        target = self.ip_entry.get().strip()
+        if not target:
+            messagebox.showwarning("提示", "请输入IP或域名")
+            return
+        if self.busy:
+            messagebox.showinfo("提示", "正在查询中，请稍候")
+            return
+        self.busy = True
+        self.query_btn.config(state=tk.DISABLED)
+        self.status_label.config(text=f"正在查询: {target} ...", foreground='blue')
+        def _do():
+            try:
+                result = self.lookup(target)
+                self.frame.after(0, lambda: self._display_single_result(result))
+            except Exception as e:
+                self.frame.after(0, lambda: self._on_query_error(str(e)))
+            finally:
+                self.frame.after(0, lambda: self._reset_busy())
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _display_single_result(self, result):
+        for item in self.detail_tree.get_children(): self.detail_tree.delete(item)
+        field_order = ['_target', '国家', '地区/省', '城市', '区县', 'ISP/运营商',
+                       '组织', 'AS号', '时区', '纬度', '经度', '邮编']
+        for key in field_order:
+            if key in result:
+                k = '查询目标' if key == '_target' else key
+                v = str(result[key])
+                if key == '_target' and result.get('_cached'):
+                    v = v + "  (来自缓存)"
+                self.detail_tree.insert('', tk.END, values=(k, v))
+        lat = result.get('纬度', '-')
+        lon = result.get('经度', '-')
+        if lat != '-' and lon != '-':
+            self.map_link_label.config(text=f"https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=10/{lat}/{lon}")
+        else:
+            self.map_link_label.config(text="(无经纬度信息)")
+        self._add_history(result)
+        source = result.get('_source', '-')
+        self.status_label.config(text=f"查询成功 [数据源: {source}]", foreground='green')
+
+    def _on_query_error(self, msg):
+        self.status_label.config(text=f"查询失败: {msg}", foreground='red')
+        messagebox.showerror("查询失败", msg)
+
+    def _reset_busy(self):
+        self.busy = False
+        self.query_btn.config(state=tk.NORMAL)
+
+    def batch_lookup(self):
+        content = self.batch_text.get('1.0', tk.END).strip()
+        if not content:
+            messagebox.showwarning("提示", "请输入要查询的IP/域名列表")
+            return
+        targets = [t.strip() for t in content.split('\n') if t.strip()]
+        if not targets: return
+        if len(targets) > 50:
+            if not messagebox.askyesno("确认", f"将要查询 {len(targets)} 个目标，可能需要较长时间，是否继续？"):
+                return
+        for item in self.batch_tree.get_children(): self.batch_tree.delete(item)
+        self.batch_btn.config(state=tk.DISABLED)
+        self.batch_progress['maximum'] = len(targets)
+        self.batch_progress['value'] = 0
+        self.status_label.config(text=f"批量查询中: 0/{len(targets)}", foreground='blue')
+        def _worker():
+            success = 0
+            fail = 0
+            for idx, t in enumerate(targets):
+                try:
+                    r = self.lookup(t)
+                    self.frame.after(0, lambda r=r: self._add_batch_row(r))
+                    self._add_history(r)
+                    success += 1
+                except Exception as e:
+                    self.frame.after(0, lambda t=t, e=str(e): self._add_batch_row_error(t, e))
+                    fail += 1
+                self.frame.after(0, lambda i=idx+1, n=len(targets): self._update_batch_progress(i, n))
+                time.sleep(0.2)
+            self.frame.after(0, lambda: self._batch_done(success, fail))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _add_batch_row(self, r):
+        self.batch_tree.insert('', tk.END, values=(
+            r.get('_target', '-'), r.get('_ip', '-'),
+            r.get('国家', '-'), r.get('地区/省', '-'),
+            r.get('城市', '-'), r.get('ISP/运营商', '-'),
+            r.get('_source', '-'),
+        ), tags=('ok',))
+        self.batch_tree.tag_configure('ok', foreground='black')
+
+    def _add_batch_row_error(self, target, err):
+        self.batch_tree.insert('', tk.END, values=(
+            target, '-', '失败', '-', '-', str(err)[:50], '-'
+        ), tags=('err',))
+        self.batch_tree.tag_configure('err', foreground='red')
+
+    def _update_batch_progress(self, current, total):
+        self.batch_progress['value'] = current
+        self.status_label.config(text=f"批量查询中: {current}/{total}", foreground='blue')
+
+    def _batch_done(self, success, fail):
+        self.batch_btn.config(state=tk.NORMAL)
+        self.status_label.config(text=f"批量完成: 成功 {success}, 失败 {fail}", foreground='green')
+        messagebox.showinfo("批量完成", f"查询完成！\n成功: {success}\n失败: {fail}")
+
+    def _add_history(self, result):
+        entry = {
+            'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'target': result.get('_target', '-'),
+            'ip': result.get('_ip', '-'),
+            'country': result.get('国家', '-'),
+            'city': result.get('城市', '-'),
+            'isp': result.get('ISP/运营商', '-'),
+        }
+        self.history.insert(0, entry)
+        if len(self.history) > 200: self.history = self.history[:200]
+        self.history_tree.insert('', 0, values=(
+            entry['time'], entry['target'], entry['ip'],
+            entry['country'], entry['city'], entry['isp']
+        ))
+
+    def relookup_selected(self):
+        sel = self.history_tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选择一条历史记录")
+            return
+        item = self.history_tree.item(sel[0])
+        target = str(item['values'][1])
+        if '->' in target:
+            target = target.split('->')[-1].strip()
+        self.ip_entry.delete(0, tk.END)
+        self.ip_entry.insert(0, target)
+        self.inner_notebook.select(0)
+        self.single_lookup()
+
+    def clear_history(self):
+        if messagebox.askyesno("确认", "确定要清空查询历史吗？"):
+            for item in self.history_tree.get_children(): self.history_tree.delete(item)
+            self.history = []
+
+    def clear_single(self):
+        self.ip_entry.delete(0, tk.END)
+        for item in self.detail_tree.get_children(): self.detail_tree.delete(item)
+        self.map_link_label.config(text="(查询后显示)")
+        self.status_label.config(text="就绪", foreground='gray')
+
+    def lookup_my_ip(self):
+        if self.busy:
+            messagebox.showinfo("提示", "正在查询中，请稍候")
+            return
+        self.busy = True
+        self.status_label.config(text="正在获取公网IP...", foreground='blue')
+        def _do():
+            try:
+                ip = self.get_my_public_ip()
+                if not ip: raise RuntimeError("无法获取公网IP")
+                self.ip_entry.delete(0, tk.END)
+                self.ip_entry.insert(0, ip)
+                self.frame.after(0, lambda: self.single_lookup())
+            except Exception as e:
+                self.frame.after(0, lambda: self._on_query_error(f"获取公网IP失败: {e}"))
+            finally:
+                self.frame.after(0, lambda: self._reset_busy())
+        threading.Thread(target=_do, daemon=True).start()
+
+    def lookup_local_ip(self):
+        self.ip_entry.delete(0, tk.END)
+        self.ip_entry.insert(0, self.local_ip)
+        self.single_lookup()
+
+    def open_map(self):
+        url = self.map_link_label.cget('text')
+        if url and url.startswith('http'):
+            try:
+                import webbrowser
+                webbrowser.open(url)
+            except Exception as e:
+                messagebox.showerror("错误", f"无法打开浏览器: {e}")
+        else:
+            messagebox.showinfo("提示", "当前查询结果无经纬度信息")
+
+    def export_results(self):
+        rows = []
+        if self.inner_notebook.index('current') == 0:
+            for item in self.detail_tree.get_children():
+                vals = self.detail_tree.item(item)['values']
+                rows.append(('单查详情', str(vals[0]), str(vals[1])))
+        elif self.inner_notebook.index('current') == 1:
+            for item in self.batch_tree.get_children():
+                vals = self.batch_tree.item(item)['values']
+                rows.append(('批量结果',) + tuple(str(v) for v in vals))
+        else:
+            for item in self.history_tree.get_children():
+                vals = self.history_tree.item(item)['values']
+                rows.append(('历史',) + tuple(str(v) for v in vals))
+        if not rows:
+            messagebox.showwarning("提示", "当前页面没有可导出的结果")
+            return
+        filename = filedialog.asksaveasfilename(defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("Text files", "*.txt"), ("All files", "*.*")],
+            initialfile=f"ip_geolocation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        if not filename: return
+        try:
+            import csv
+            with open(filename, 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['来源', '时间/字段', '目标', 'IP', '国家', '地区', '城市', 'ISP'])
+                for r in rows:
+                    writer.writerow(list(r) + [''] * max(0, 8 - len(r)))
+            messagebox.showinfo("导出成功", f"结果已保存到:\n{filename}")
+        except Exception as e:
+            messagebox.showerror("导出失败", f"导出时发生错误:\n{e}")
+
+    def copy_detail(self):
+        if self.inner_notebook.index('current') == 0:
+            lines = []
+            for item in self.detail_tree.get_children():
+                vals = self.detail_tree.item(item)['values']
+                lines.append(f"{str(vals[0]):<15}: {vals[1]}")
+            text = '\n'.join(lines)
+        elif self.inner_notebook.index('current') == 1:
+            lines = ['目标\tIP\t国家\t地区\t城市\tISP\t数据源']
+            for item in self.batch_tree.get_children():
+                vals = self.batch_tree.item(item)['values']
+                lines.append('\t'.join(str(v) for v in vals))
+            text = '\n'.join(lines)
+        else:
+            lines = ['时间\t目标\tIP\t国家\t城市\tISP']
+            for item in self.history_tree.get_children():
+                vals = self.history_tree.item(item)['values']
+                lines.append('\t'.join(str(v) for v in vals))
+            text = '\n'.join(lines)
+        if not text:
+            messagebox.showinfo("提示", "没有可复制的内容")
+            return
+        self.frame.clipboard_clear()
+        self.frame.clipboard_append(text)
+        messagebox.showinfo("复制成功", "内容已复制到剪贴板")
+
+    def clear_all(self):
+        if messagebox.askyesno("确认", "确定要清空所有结果吗？"):
+            self.clear_single()
+            for item in self.batch_tree.get_children(): self.batch_tree.delete(item)
+            for item in self.history_tree.get_children(): self.history_tree.delete(item)
+            self.history = []
+            self.cache = {}
+            self.status_label.config(text="已清空", foreground='gray')
+
+
 class PortScannerGUI:
     def __init__(self, root, embedded=False, results_page=None):
         self.root = root
@@ -1314,10 +1863,13 @@ def main():
     notebook.add(nmap_frame, text="Nmap扫描")
     subnet_frame = ttk.Frame(notebook)
     notebook.add(subnet_frame, text="子网掩码计算")
+    ipgeo_frame = ttk.Frame(notebook)
+    notebook.add(ipgeo_frame, text="IP归属地查询")
     scanner_app = PortScannerGUI(scanner_frame, embedded=True, results_page=results_app)
     nmap_app = NmapScanGUI(nmap_frame)
     nmap_app.set_root(root)
     subnet_app = SubnetCalculatorGUI(subnet_frame)
+    ipgeo_app = IPGeolocationGUI(ipgeo_frame)
     root.update_idletasks()
     width = root.winfo_width()
     height = root.winfo_height()
