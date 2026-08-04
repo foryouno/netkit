@@ -1847,6 +1847,962 @@ class PortScannerGUI:
             else: self.root.destroy()
 
 
+class MTRScanner:
+    """MTR (My Traceroute) - 路由追踪与丢包率统计
+
+    实现思路:
+    1. 通过 tracert (Windows) / traceroute (Linux/Mac) 发现路径
+    2. 对路径上每个节点使用 ping 命令进行多轮探测
+    3. 使用 Welford 在线算法实时计算均值与标准差
+    4. 如果系统安装了原生 mtr 命令 (Linux/Mac)，可使用原生模式
+    """
+
+    def __init__(self, target, max_hops=30, count=10, interval=1.0,
+                 timeout=2.0, packet_size=64, probe_type='icmp', use_native=False,
+                 progress_callback=None, hop_callback=None,
+                 stats_callback=None, ping_callback=None,
+                 status_callback=None, log_callback=None,
+                 complete_callback=None):
+        self.target = target
+        self.max_hops = max_hops
+        self.count = count
+        self.interval = interval
+        self.timeout = timeout
+        self.packet_size = packet_size  # ICMP 包大小 (字节)
+        self.probe_type = probe_type    # 'icmp' (默认) 或 'tcp' (TCP 探测)
+        self.use_native = use_native
+        self.progress_callback = progress_callback
+        self.hop_callback = hop_callback
+        self.stats_callback = stats_callback
+        self.ping_callback = ping_callback  # 每包回调: (ttl, hop, rtt, is_lost)
+        self.status_callback = status_callback
+        self.log_callback = log_callback
+        self.complete_callback = complete_callback
+        self.running = False
+        self.hops = {}
+        self.target_ip = None
+        self.system = platform.system()
+        self.native_mtr = self._find_mtr() if self.system != 'Windows' else None
+        self.traceroute_cmd = self._find_traceroute_cmd()
+        self._asn_cache = {}  # AS 号查询缓存
+
+    def _find_mtr(self):
+        if self.system == 'Windows':
+            return None
+        try:
+            result = subprocess.run(['which', 'mtr'], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                path = result.stdout.strip().split('\n')[0].strip()
+                if path:
+                    return path
+        except Exception:
+            pass
+        return None
+
+    def _find_traceroute_cmd(self):
+        if self.system == 'Windows':
+            return 'tracert'
+        for cmd in ['traceroute', 'tracepath']:
+            try:
+                result = subprocess.run(['which', cmd], capture_output=True, text=True, timeout=2)
+                if result.returncode == 0:
+                    path = result.stdout.strip().split('\n')[0].strip()
+                    if path:
+                        return cmd
+            except Exception:
+                continue
+        return None
+
+    def _log(self, msg, color=None):
+        if self.log_callback:
+            try:
+                self.log_callback(msg, color)
+            except Exception:
+                pass
+
+    def _status(self, msg):
+        if self.status_callback:
+            try:
+                self.status_callback(msg)
+            except Exception:
+                pass
+
+    def _resolve_target(self):
+        try:
+            self.target_ip = socket.gethostbyname(self.target)
+            return True
+        except Exception as e:
+            self._log(f"无法解析目标 {self.target}: {e}", 'red')
+            return False
+
+    def _discover_path(self):
+        """通过系统 tracert/traceroute 命令发现网络路径"""
+        if not self.traceroute_cmd:
+            self._log("未找到 tracert/traceroute 命令", 'red')
+            return {}
+
+        self._status("正在发现网络路径...")
+        self._log(f"使用 {self.traceroute_cmd} 发现路径...", 'blue')
+
+        try:
+            if self.system == 'Windows':
+                cmd = [self.traceroute_cmd, '-d', '-h', str(self.max_hops),
+                       '-w', str(max(1, int(self.timeout * 1000))), self.target]
+            else:
+                cmd = [self.traceroute_cmd, '-n', '-m', str(self.max_hops),
+                       '-w', str(max(1, int(self.timeout))), self.target]
+
+            self._log(f"执行命令: {' '.join(cmd)}")
+
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, encoding='utf-8', errors='ignore')
+            output_lines = []
+            for line in iter(process.stdout.readline, ''):
+                if not self.running:
+                    process.terminate()
+                    break
+                line = line.rstrip()
+                if line.strip():
+                    self._log(f"  {line}", 'gray')
+                    output_lines.append(line)
+            try:
+                process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+            output = '\n'.join(output_lines)
+            return self._parse_traceroute_output(output)
+        except FileNotFoundError:
+            self._log(f"未找到命令: {self.traceroute_cmd}", 'red')
+            return {}
+        except Exception as e:
+            self._log(f"路径发现失败: {e}", 'red')
+            return {}
+
+    def _parse_traceroute_output(self, output):
+        """解析 tracert/traceroute 输出，提取每一跳的 IP"""
+        hops = {}
+        for line in output.split('\n'):
+            m = re.match(r'^\s*(\d+)\s+', line)
+            if not m:
+                continue
+            ttl = int(m.group(1))
+            if ttl <= 0 or ttl > self.max_hops:
+                continue
+            ip_match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', line)
+            if not ip_match:
+                continue
+            ip = ip_match.group(1)
+            # 校验 IP 合法性
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if ttl in hops:
+                continue
+            hostname = ip
+            try:
+                hostname = socket.gethostbyaddr(ip)[0]
+            except Exception:
+                pass
+            hops[ttl] = {
+                'ip': ip, 'hostname': hostname,
+                'times': [], 'sent': 0, 'lost': 0,
+                'last': None, 'best': None, 'worst': None,
+                'avg': None, 'stdev': None, 'm2': 0,
+            }
+        return hops
+
+    def _ping_host(self, ip):
+        """对单个主机执行一次 ping，返回延迟 (ms) 或 None"""
+        try:
+            # 按探测类型选择命令 (icmp: ping, tcp: TCP 连接 80/443)
+            if self.probe_type == 'tcp':
+                # TCP 探测: 用 socket.connect 模拟 (适合穿透 ICMP 封锁的网络)
+                return self._tcp_probe(ip)
+            # ICMP 探测 (默认)
+            if self.system == 'Windows':
+                cmd = ['ping', '-n', '1', '-l', str(max(8, min(65500, self.packet_size))),
+                       '-w', str(max(1, int(self.timeout * 1000))), ip]
+            else:
+                cmd = ['ping', '-c', '1', '-s', str(max(8, min(65507, self.packet_size - 28))),
+                       '-W', str(max(1, int(self.timeout))), ip]
+
+            start = time.time()
+            result = subprocess.run(cmd, capture_output=True, timeout=self.timeout + 2)
+            elapsed_ms = (time.time() - start) * 1000
+
+            if result.returncode == 0:
+                output = result.stdout.decode('utf-8', errors='ignore')
+                m = re.search(r'time[=<]([\d.]+)\s*ms', output)
+                if m:
+                    return float(m.group(1))
+                return elapsed_ms
+            return None
+        except subprocess.TimeoutExpired:
+            return None
+        except Exception:
+            return None
+
+    def _tcp_probe(self, ip):
+        """TCP 探测 (像 mtr -T): 尝试连接常见端口, 用连接时间作为延迟"""
+        # 尝试常用端口: 443 (HTTPS), 80 (HTTP), 22 (SSH)
+        for tcp_port in (443, 80, 22):
+            try:
+                start = time.time()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(self.timeout)
+                if sock.connect_ex((ip, tcp_port)) == 0:
+                    elapsed = (time.time() - start) * 1000
+                    sock.close()
+                    return elapsed
+                sock.close()
+            except Exception:
+                pass
+        return None
+
+    def _lookup_asn(self, ip):
+        """使用 DNS 查询 (Team Cymru) 获取 IP 的 AS 号
+
+        原理: 将 IP 倒序拼接 + .origin.asn.cymru.com 查询 TXT 记录
+        范例: 8.8.8.8 -> 8.8.8.8.origin.asn.cymru.com -> "15169 | 8.8.8.0/24 | US | arin | ..."
+        """
+        if not ip or ip in self._asn_cache:
+            return self._asn_cache.get(ip, '-')
+        try:
+            parts = ip.split('.')
+            if len(parts) != 4:
+                self._asn_cache[ip] = '-'
+                return '-'
+            # 倒序: 8.8.8.8 -> 8.8.8.8.origin.asn.cymru.com
+            reversed_ip = '.'.join(reversed(parts))
+            query = f"{reversed_ip}.origin.asn.cymru.com"
+            answers = socket.getaddrinfo(query, None, type=socket.SOCK_STREAM)
+            # 实际上 Cymru 返回 TXT 记录, 尝试解析
+            try:
+                import subprocess as sp
+                result = sp.run(['nslookup', '-type=txt', query, '8.8.8.8'],
+                               capture_output=True, text=True, timeout=2)
+                txt = result.stdout
+                # 查找 "15169 | ..." 格式
+                m = re.search(r'"(\d+)\s*\|', txt)
+                if m:
+                    asn = f"AS{m.group(1)}"
+                    self._asn_cache[ip] = asn
+                    return asn
+            except Exception:
+                pass
+            # 回退: 使用 gethostbyname (有时会有提示)
+            self._asn_cache[ip] = '-'
+            return '-'
+        except Exception:
+            self._asn_cache[ip] = '-'
+            return '-'
+
+    def _run_native_mtr(self):
+        """使用系统原生 mtr 命令 (Linux/Mac) 执行实时输出"""
+        if not self.native_mtr:
+            return False
+
+        self._log(f"使用原生 mtr: {self.native_mtr}", 'blue')
+        try:
+            cmd = [self.native_mtr, '-n', '-r', '-c', str(self.count),
+                   '-m', str(self.max_hops), '-i', str(self.interval), self.target]
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, encoding='utf-8', errors='ignore')
+            output_lines = []
+            for line in iter(process.stdout.readline, ''):
+                if not self.running:
+                    process.terminate()
+                    break
+                line_s = line.rstrip()
+                self._log(line_s, 'gray')
+                output_lines.append(line_s)
+            try:
+                process.wait(timeout=self.timeout * self.max_hops + self.count * self.interval + 30)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+            # 解析原生输出以填充 hops
+            self._parse_native_mtr_output('\n'.join(output_lines))
+            return True
+        except FileNotFoundError:
+            self._log("找不到 mtr 命令", 'red')
+            return False
+        except Exception as e:
+            self._log(f"原生 mtr 执行失败: {e}", 'red')
+            return False
+
+    def _parse_native_mtr_output(self, output):
+        """解析原生 mtr --report 输出"""
+        hops = {}
+        for line in output.split('\n'):
+            # 格式如: " 1. 192.168.1.1    0.0%   10   1.2  0.8  0.5  1.5   0.3"
+            m = re.match(r'^\s*(\d+)\.\s+(\S+)\s+(\d+\.\d+)%\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)', line)
+            if m:
+                ttl = int(m.group(1))
+                ip = m.group(2)
+                loss_pct = float(m.group(3))
+                sent = int(m.group(4))
+                last = float(m.group(5))
+                avg = float(m.group(6))
+                best = float(m.group(7))
+                worst = float(m.group(8))
+                stdev = float(m.group(9))
+                lost = int(round(sent * loss_pct / 100))
+                hostname = ip
+                try:
+                    hostname = socket.gethostbyaddr(ip)[0]
+                except Exception:
+                    pass
+                hops[ttl] = {
+                    'ip': ip, 'hostname': hostname,
+                    'times': [last], 'sent': sent, 'lost': lost,
+                    'last': last, 'best': best, 'worst': worst,
+                    'avg': avg, 'stdev': stdev, 'm2': 0,
+                }
+                # 回调
+                if self.hop_callback:
+                    try:
+                        self.hop_callback(ttl, hops[ttl])
+                    except Exception:
+                        pass
+        self.hops = hops
+
+    def _update_hop_stats(self, hop, rtt, is_lost=False):
+        """使用 Welford 在线算法更新单跳统计 (含丢包模式)"""
+        hop['times'].append(rtt)
+        hop['last'] = rtt
+        if hop['best'] is None or rtt < hop['best']:
+            hop['best'] = rtt
+        if hop['worst'] is None or rtt > hop['worst']:
+            hop['worst'] = rtt
+        n = len(hop['times'])
+        if n == 1:
+            hop['avg'] = rtt
+            hop['m2'] = 0
+            hop['stdev'] = 0.0
+        else:
+            delta = rtt - hop['avg']
+            hop['avg'] += delta / n
+            delta2 = rtt - hop['avg']
+            hop['m2'] += delta * delta2
+            if n > 1:
+                hop['stdev'] = (hop['m2'] / (n - 1)) ** 0.5
+        # 丢包模式: True=丢失, False=收到 (WinMTR 风格小图)
+        if 'loss_history' not in hop:
+            hop['loss_history'] = []
+        hop['loss_history'].append(is_lost)
+        # 限制最大长度 (避免内存无限增长)
+        if len(hop['loss_history']) > 200:
+            hop['loss_history'] = hop['loss_history'][-200:]
+
+    def run(self):
+        """执行 MTR：先发现路径，再逐跳统计"""
+        self.running = True
+        try:
+            if not self._resolve_target():
+                return {}
+
+            self._log(f"MTR 报告 - 目标: {self.target} ({self.target_ip})", 'blue')
+            self._log(f"参数: 最大跳数={self.max_hops}, 每跳ping数={self.count}, "
+                      f"间隔={self.interval}秒, 超时={self.timeout}秒")
+            self._log("=" * 80)
+
+            # 优先尝试原生 mtr
+            if self.use_native and self.native_mtr:
+                if self._run_native_mtr():
+                    self._status("MTR 完成")
+                    return self.hops
+                self._log("原生 mtr 失败，回退到标准模式", 'orange')
+
+            # 标准模式
+            self.hops = self._discover_path()
+
+            if not self.hops:
+                self._log("未能发现任何路由节点", 'red')
+                return {}
+
+            self._log(f"\n发现 {len(self.hops)} 个路由节点，开始统计...", 'blue')
+
+            # 先把已知跳添加到 UI
+            for ttl in sorted(self.hops.keys()):
+                if self.hop_callback:
+                    try:
+                        self.hop_callback(ttl, self.hops[ttl])
+                    except Exception:
+                        pass
+
+            # 多轮 ping - 并行 ping 所有跳 (极速实时模式)
+            # 每一轮: 对所有跳同时发起 ping, 等待最慢的那个完成, 一次性更新所有跳的 loss%
+            # 这才是真正 MTR 的工作方式 (而非逐跳串行)
+            infinite = self.count <= 0
+            max_rounds = self.count if not infinite else 1
+            round_num = 0
+            hop_ttls = sorted(self.hops.keys())
+            while self.running:
+                round_num += 1
+                self._status(f"第 {round_num} 轮探测 (并行 {len(hop_ttls)} 跳)...")
+
+                # 1) 同时给所有跳 +1 sent 计数
+                for ttl in hop_ttls:
+                    self.hops[ttl]['sent'] += 1
+
+                # 2) 并行 ping 所有跳 (每个跳独立线程)
+                ping_results = {}  # ttl -> (rtt_ms, is_lost)
+                ping_threads = []
+
+                def _do_one_ping(ttl):
+                    if not self.running:
+                        return
+                    hop = self.hops[ttl]
+                    # start 回调 (高亮当前正在 ping 的跳)
+                    if self.ping_callback:
+                        try:
+                            self.ping_callback(ttl, hop, None, False, 'start')
+                        except Exception:
+                            pass
+                    rtt = self._ping_host(hop['ip'])
+                    ping_results[ttl] = (rtt, rtt is None)
+
+                for ttl in hop_ttls:
+                    if not self.running:
+                        break
+                    t = threading.Thread(target=_do_one_ping, args=(ttl,), daemon=True)
+                    t.start()
+                    ping_threads.append(t)
+                # 等待所有 ping 完成 (取最慢的一个的耗时, 而非所有耗时之和)
+                for t in ping_threads:
+                    t.join(timeout=self.timeout + 3)
+
+                # 3) 顺序更新每跳的统计并触发 done 回调 (loss% 此时已变化)
+                for ttl in hop_ttls:
+                    if ttl not in ping_results:
+                        continue
+                    hop = self.hops[ttl]
+                    rtt, is_lost = ping_results[ttl]
+                    if not is_lost:
+                        self._update_hop_stats(hop, rtt, is_lost=False)
+                    else:
+                        hop['lost'] += 1
+                        if 'loss_history' not in hop:
+                            hop['loss_history'] = []
+                        hop['loss_history'].append(True)
+                        if len(hop['loss_history']) > 200:
+                            hop['loss_history'] = hop['loss_history'][-200:]
+                    # done 回调 - 此时 loss% 已真实变化
+                    if self.ping_callback:
+                        try:
+                            self.ping_callback(ttl, hop, rtt, is_lost, 'done')
+                        except Exception:
+                            pass
+                    if self.stats_callback:
+                        try:
+                            self.stats_callback(ttl, hop)
+                        except Exception:
+                            pass
+
+                if self.progress_callback:
+                    try:
+                        if infinite:
+                            self.progress_callback(round_num, 0)
+                        else:
+                            self.progress_callback(round_num, max_rounds)
+                    except Exception:
+                        pass
+
+                if not infinite and round_num >= max_rounds:
+                    break
+                if self.running and self.interval > 0:
+                    time.sleep(self.interval)
+
+            self._log("\n" + "=" * 80, 'blue')
+            self._log("MTR 完成", 'green')
+            self._status("MTR 完成")
+        except Exception as e:
+            self._log(f"MTR 执行出错: {e}", 'red')
+        finally:
+            self.running = False
+            if self.complete_callback:
+                try:
+                    self.complete_callback(self.hops)
+                except Exception:
+                    pass
+
+        return self.hops
+
+    def stop(self):
+        self.running = False
+
+    def get_summary_text(self):
+        """生成格式化的 MTR 报告文本"""
+        lines = []
+        lines.append("=" * 100)
+        lines.append("                     MTR (My Traceroute) 网络诊断报告")
+        lines.append("=" * 100)
+        lines.append(f"目标:        {self.target} ({self.target_ip})")
+        lines.append(f"生成时间:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"参数:        最大跳数={self.max_hops}  每跳ping数={self.count if self.count > 0 else '无限'}  "
+                     f"间隔={self.interval}秒  超时={self.timeout}秒")
+        lines.append("")
+        header = (f"{'Hop':<5} {'Host':<32} {'Loss%':>7} {'Sent':>5} "
+                  f"{'Last':>9} {'Avg':>9} {'Best':>9} {'Wrst':>9} {'StDev':>9}")
+        lines.append(header)
+        lines.append("-" * 100)
+        if not self.hops:
+            lines.append("(无路由节点数据)")
+        for ttl in sorted(self.hops.keys()):
+            hop = self.hops[ttl]
+            loss_pct = (hop['lost'] / hop['sent'] * 100) if hop['sent'] > 0 else 0.0
+            hostname = hop['hostname']
+            if len(hostname) > 30:
+                hostname = hostname[:29] + '~'
+
+            def fmt(v):
+                return f"{v:>7.1f}ms" if v is not None else f"{'-':>9}"
+
+            lines.append(
+                f"{ttl:<5} {hostname:<32} {loss_pct:>6.1f}% {hop['sent']:>5} "
+                f"{fmt(hop['last'])} {fmt(hop['avg'])} {fmt(hop['best'])} "
+                f"{fmt(hop['worst'])} {fmt(hop['stdev'])}"
+            )
+        lines.append("=" * 100)
+        return '\n'.join(lines)
+
+
+class MTRScanGUI:
+    """MTR 图形界面 - 路由追踪与丢包率统计"""
+
+    def __init__(self, parent):
+        self.frame = ttk.Frame(parent, padding="10")
+        self.frame.pack(fill=tk.BOTH, expand=True)
+        self.scanner = None
+        self.running = False
+        self.root = None
+        self.hop_items = {}  # ttl -> treeview item id
+        self.active_hop = None  # 正在 ping 的跳数
+        self.round_num = 0  # 当前轮数
+        self.create_widgets()
+
+    def set_root(self, root):
+        self.root = root
+
+    def create_widgets(self):
+        # === 目标输入 ===
+        input_frame = ttk.LabelFrame(self.frame, text="目标设置", padding="10")
+        input_frame.pack(fill=tk.X, pady=5)
+        input_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(input_frame, text="目标 (IP/域名):", width=15).grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.target_entry = ttk.Entry(input_frame, width=50, font=('Consolas', 10))
+        self.target_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
+        self.target_entry.insert(0, "8.8.8.8")
+        self.target_entry.bind('<Return>', lambda e: self.start_mtr())
+
+        # 快捷目标
+        quick_frame = ttk.Frame(input_frame)
+        quick_frame.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        ttk.Label(quick_frame, text="快捷目标:", foreground='gray').pack(side=tk.LEFT, padx=5)
+        quick_targets = [
+            ('Google DNS', '8.8.8.8'),
+            ('Cloudflare', '1.1.1.1'),
+            ('阿里DNS', '223.5.5.5'),
+            ('114DNS', '114.114.114.114'),
+            ('百度', 'baidu.com'),
+            ('GitHub', 'github.com'),
+            ('本机', '127.0.0.1'),
+        ]
+        for name, target in quick_targets:
+            ttk.Button(quick_frame, text=name,
+                       command=lambda t=target: self._set_target(t),
+                       width=10).pack(side=tk.LEFT, padx=2)
+
+        # === 参数设置 ===
+        settings_frame = ttk.LabelFrame(self.frame, text="MTR 参数", padding="10")
+        settings_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(settings_frame, text="最大跳数:").grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.max_hops_var = tk.StringVar(value="30")
+        ttk.Spinbox(settings_frame, from_=1, to=64, width=10,
+                    textvariable=self.max_hops_var).grid(row=0, column=1, padx=5)
+
+        ttk.Label(settings_frame, text="每跳ping数:").grid(row=0, column=2, sticky=tk.W, padx=5)
+        self.count_var = tk.StringVar(value="10")
+        ttk.Spinbox(settings_frame, from_=0, to=1000, width=10,
+                    textvariable=self.count_var).grid(row=0, column=3, padx=5)
+        ttk.Label(settings_frame, text="(0 表示无限循环)", foreground='gray',
+                  font=('微软雅黑', 8)).grid(row=0, column=4, sticky=tk.W, padx=5)
+
+        ttk.Label(settings_frame, text="间隔 (秒):").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        self.interval_var = tk.StringVar(value="1")
+        ttk.Spinbox(settings_frame, from_=0.1, to=60, increment=0.5, width=10,
+                    textvariable=self.interval_var).grid(row=1, column=1, padx=5, pady=5)
+
+        ttk.Label(settings_frame, text="超时 (秒):").grid(row=1, column=2, sticky=tk.W, padx=5, pady=5)
+        self.timeout_var = tk.StringVar(value="2")
+        ttk.Spinbox(settings_frame, from_=0.5, to=30, increment=0.5, width=10,
+                    textvariable=self.timeout_var).grid(row=1, column=3, padx=5, pady=5)
+
+        # 命令预览
+        cmd_frame = ttk.Frame(settings_frame)
+        cmd_frame.grid(row=2, column=0, columnspan=5, sticky=tk.W, pady=(5, 0))
+        ttk.Label(cmd_frame, text="命令预览:", foreground='gray').pack(side=tk.LEFT, padx=5)
+        self.cmd_preview = ttk.Label(cmd_frame, text="tracert -d -h 30 -w 2000 8.8.8.8",
+                                     font=('Consolas', 9), foreground='blue')
+        self.cmd_preview.pack(side=tk.LEFT, padx=5)
+        for var in [self.target_entry, self.max_hops_var, self.count_var,
+                    self.interval_var, self.timeout_var]:
+            pass
+        # 绑定更新
+        for var in [self.max_hops_var, self.interval_var, self.timeout_var]:
+            var.trace_add('write', lambda *args: self._update_cmd_preview())
+        self.target_entry.bind('<KeyRelease>', lambda e: self._update_cmd_preview())
+        self._update_cmd_preview()
+
+        # === 操作按钮 ===
+        btn_frame = ttk.Frame(self.frame)
+        btn_frame.pack(fill=tk.X, pady=10)
+        self.start_btn = ttk.Button(btn_frame, text="▶ 开始 MTR", command=self.start_mtr, width=15)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        self.stop_btn = ttk.Button(btn_frame, text="■ 停止", command=self.stop_mtr,
+                                   width=15, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="清空结果", command=self.clear_results,
+                   width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="导出报告", command=self.export_results,
+                   width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="复制表格", command=self.copy_results,
+                   width=15).pack(side=tk.LEFT, padx=5)
+
+        # === 进度条 ===
+        progress_frame = ttk.Frame(self.frame)
+        progress_frame.pack(fill=tk.X, pady=5)
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var,
+                                            maximum=100, mode='determinate')
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.status_label = ttk.Label(progress_frame, text="就绪", font=('Consolas', 9))
+        self.status_label.pack(side=tk.LEFT, padx=5)
+
+        # === 结果表格 ===
+        result_frame = ttk.LabelFrame(self.frame, text="MTR 实时结果  (丢包率>=50%红色, >=10%橙色, >0%黄色)",
+                                      padding="5")
+        result_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        result_frame.columnconfigure(0, weight=1)
+        result_frame.rowconfigure(0, weight=1)
+
+        columns = ('hop', 'host', 'ip', 'loss', 'sent', 'last', 'avg', 'best', 'wrst', 'stdev')
+        self.result_tree = ttk.Treeview(result_frame, columns=columns, show='headings', height=15)
+        col_config = [
+            ('hop', '跳数', 60, tk.CENTER),
+            ('host', '主机名', 220, tk.W),
+            ('ip', 'IP 地址', 130, tk.W),
+            ('loss', 'Loss%', 80, tk.CENTER),
+            ('sent', 'Sent', 60, tk.CENTER),
+            ('last', 'Last', 80, tk.CENTER),
+            ('avg', 'Avg', 80, tk.CENTER),
+            ('best', 'Best', 80, tk.CENTER),
+            ('wrst', 'Wrst', 80, tk.CENTER),
+            ('stdev', 'StDev', 80, tk.CENTER),
+        ]
+        for col, text, width, anchor in col_config:
+            self.result_tree.heading(col, text=text)
+            self.result_tree.column(col, width=width, anchor=anchor)
+
+        tree_scroll_y = ttk.Scrollbar(result_frame, orient=tk.VERTICAL, command=self.result_tree.yview)
+        self.result_tree.configure(yscrollcommand=tree_scroll_y.set)
+        self.result_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        tree_scroll_y.grid(row=0, column=1, sticky=(tk.N, tk.S))
+
+        # 颜色标签
+        self.result_tree.tag_configure('high_loss', foreground='red')
+        self.result_tree.tag_configure('med_loss', foreground='#FF8C00')
+        self.result_tree.tag_configure('low_loss', foreground='#DAA520')
+        self.result_tree.tag_configure('target', foreground='green')
+        self.result_tree.tag_configure('normal', foreground='black')
+        # 活动跳: 蓝色加粗背景
+        try:
+            self.result_tree.tag_configure('active_hop', background='#E3F2FD', foreground='#1565C0')
+            self.result_tree.tag_configure('active_loss', background='#FFEBEE', foreground='red')
+        except Exception:
+            pass
+        # 高亮表头提示
+        style = ttk.Style()
+        try:
+            style.configure('Active.Horizontal.TScale', background='#1565C0')
+        except Exception:
+            pass
+
+        # === 日志区域 ===
+        log_frame = ttk.LabelFrame(self.frame, text="日志", padding="5")
+        log_frame.pack(fill=tk.X, pady=5)
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, font=('Consolas', 9), wrap=tk.WORD)
+        self.log_text.pack(fill=tk.X)
+        for color in ['red', 'green', 'blue', 'orange', 'gray']:
+            self.log_text.tag_configure(color, foreground=color)
+
+    def _set_target(self, target):
+        self.target_entry.delete(0, tk.END)
+        self.target_entry.insert(0, target)
+        self._update_cmd_preview()
+
+    def _update_cmd_preview(self):
+        target = self.target_entry.get().strip() or "TARGET"
+        try:
+            max_hops = self.max_hops_var.get()
+            timeout = self.timeout_var.get()
+        except Exception:
+            max_hops, timeout = "30", "2"
+        if platform.system() == 'Windows':
+            try:
+                t_ms = str(max(1, int(float(timeout) * 1000)))
+            except Exception:
+                t_ms = "2000"
+            cmd = f"tracert -d -h {max_hops} -w {t_ms} {target}"
+        else:
+            cmd = f"traceroute -n -m {max_hops} -w {timeout} {target}"
+        self.cmd_preview.config(text=cmd)
+
+    # ---- 回调辅助 ----
+    def _safe_after(self, fn, *args):
+        if self.root:
+            try:
+                self.root.after(0, lambda: fn(*args))
+            except Exception:
+                pass
+        else:
+            try:
+                fn(*args)
+            except Exception:
+                pass
+
+    def log(self, msg, color=None):
+        self._safe_after(self._log_ui, msg, color)
+
+    def _log_ui(self, msg, color):
+        self.log_text.insert(tk.END, msg + "\n", color if color else '')
+        self.log_text.see(tk.END)
+
+    def status(self, msg):
+        self._safe_after(self.status_label.config, text=msg)
+
+    # ---- 控制 ----
+    def start_mtr(self):
+        if self.running:
+            messagebox.showinfo("提示", "MTR 正在运行中，请先停止")
+            return
+
+        target = self.target_entry.get().strip()
+        if not target:
+            messagebox.showerror("输入错误", "请输入目标 IP 或域名")
+            return
+
+        try:
+            max_hops = int(self.max_hops_var.get())
+            count = int(self.count_var.get())
+            interval = float(self.interval_var.get())
+            timeout = float(self.timeout_var.get())
+            if max_hops <= 0 or count < 0 or interval <= 0 or timeout <= 0:
+                raise ValueError()
+        except (ValueError, tk.TclError):
+            messagebox.showerror("输入错误", "参数必须是有效的正整数")
+            return
+
+        self.running = True
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.progress_var.set(0)
+
+        self.round_num = 0
+        self.active_hop = None
+
+        self.scanner = MTRScanner(
+            target=target, max_hops=max_hops, count=count,
+            interval=interval, timeout=timeout,
+            hop_callback=self._on_hop_discovered,
+            stats_callback=self._on_stats_updated,
+            ping_callback=self._on_ping,  # 每包实时回调
+            progress_callback=self._on_progress,
+            status_callback=self.status,
+            log_callback=self.log,
+        )
+
+        self.log_text.insert(tk.END, f"\n{'=' * 60}\n")
+        self.log_text.insert(tk.END, f"开始 MTR: 目标={target}\n")
+        self.log_text.insert(tk.END, f"{'=' * 60}\n")
+        # 详细模式: 记录每包
+        self._packet_log_enabled = True
+
+        thread = threading.Thread(target=self._run_mtr, daemon=True)
+        thread.start()
+
+    def _run_mtr(self):
+        try:
+            self.scanner.run()
+        except Exception as e:
+            self.log(f"MTR 执行出错: {e}", 'red')
+        finally:
+            self._safe_after(self._scan_complete)
+
+    def _on_hop_discovered(self, ttl, hop):
+        self._safe_after(self._add_or_update_hop_row, ttl, hop)
+
+    def _on_stats_updated(self, ttl, hop):
+        self._safe_after(self._add_or_update_hop_row, ttl, hop)
+
+    def _on_ping(self, ttl, hop, rtt, is_lost, phase):
+        """每包实时回调: start=开始 ping, done=ping 结束 (结果已更新)
+        用于高亮当前正在 ping 的跳, 并记录每包详情。
+        """
+        def _ui():
+            # 显示状态: 当前正在 ping 的跳
+            if phase == 'start':
+                self.active_hop = ttl
+                if self.running and self.scanner:
+                    sent = hop.get('sent', 0)
+                    self.status_label.config(
+                        text=f"第 {sent} 包 → 正在 ping 跳 {ttl} ({hop.get('ip', '-')})"
+                    )
+                return
+            # phase == 'done' - 此包已完成, loss% 已变化
+            # 重置 active_hop 后清高亮 (依赖 _add_or_update_hop_row 设置的 tags)
+            if self.active_hop == ttl:
+                self.active_hop = None
+            # 日志: 记录每包结果
+            if getattr(self, '_packet_log_enabled', False):
+                loss_pct = (hop['lost'] / hop['sent'] * 100) if hop['sent'] > 0 else 0.0
+                ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                if is_lost:
+                    self.log_text.insert(tk.END,
+                        f"  [{ts}] 跳 {ttl} ({hop.get('ip', '-')}) 丢包  → Loss {loss_pct:.1f}%\n",
+                        'red')
+                else:
+                    self.log_text.insert(tk.END,
+                        f"  [{ts}] 跳 {ttl} ({hop.get('ip', '-')}) {rtt:.1f}ms  → Loss {loss_pct:.1f}%\n",
+                        'green')
+                self.log_text.see(tk.END)
+        self._safe_after(_ui)
+
+    def _add_or_update_hop_row(self, ttl, hop):
+        # 计算丢包率
+        loss_pct = (hop['lost'] / hop['sent'] * 100) if hop['sent'] > 0 else 0.0
+
+        hostname = hop['hostname']
+        if len(hostname) > 40:
+            hostname = hostname[:39] + '~'
+
+        def fmt(v):
+            return f"{v:.1f}" if v is not None else '-'
+
+        values = (
+            str(ttl), hostname, hop['ip'],
+            f"{loss_pct:.1f}%", str(hop['sent']),
+            fmt(hop['last']), fmt(hop['avg']),
+            fmt(hop['best']), fmt(hop['worst']),
+            fmt(hop['stdev'])
+        )
+
+        # 颜色标签 (基于丢包率)
+        tags = []
+        try:
+            target_ip = self.scanner.target_ip if self.scanner else None
+        except Exception:
+            target_ip = None
+        if target_ip and hop['ip'] == target_ip:
+            tags.append('target')
+        elif loss_pct >= 50:
+            tags.append('high_loss')
+        elif loss_pct >= 10:
+            tags.append('med_loss')
+        elif loss_pct > 0:
+            tags.append('low_loss')
+        else:
+            tags.append('normal')
+
+        # 高亮当前正在 ping 的跳
+        if self.active_hop == ttl:
+            tags = [t for t in tags if t != 'normal']
+            tags.append('active_hop')
+        if getattr(self, '_flash_loss', None) == ttl:
+            tags = [t for t in tags if t != 'normal']
+            tags.append('active_loss')
+
+        if ttl in self.hop_items:
+            self.result_tree.item(self.hop_items[ttl], values=values, tags=tags)
+        else:
+            item_id = self.result_tree.insert('', tk.END, values=values, tags=tags)
+            self.hop_items[ttl] = item_id
+
+    def _on_progress(self, current, total):
+        def _update():
+            if total and total > 0:
+                self.progress_var.set(current / total * 100)
+            else:
+                # 无限模式：周期性滚动
+                self.progress_var.set((current % 100))
+        self._safe_after(_update)
+
+    def _scan_complete(self):
+        self.running = False
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.progress_var.set(100)
+        if self.status_label.cget('text') == '就绪':
+            self.status_label.config(text="已完成")
+
+    def stop_mtr(self):
+        if self.scanner:
+            self.scanner.stop()
+        self.log("[用户停止] MTR 已停止", 'orange')
+        self.running = False
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.status_label.config(text="已停止")
+
+    def clear_results(self):
+        if self.running:
+            if not messagebox.askyesno("确认", "MTR 正在运行，确定要清空吗？"):
+                return
+            self.stop_mtr()
+        for item in self.result_tree.get_children():
+            self.result_tree.delete(item)
+        self.hop_items = {}
+        self.log_text.delete('1.0', tk.END)
+        self.progress_var.set(0)
+        self.active_hop = None
+        self.round_num = 0
+        self.status_label.config(text="就绪")
+
+    def export_results(self):
+        if not self.scanner or not self.scanner.hops:
+            messagebox.showwarning("警告", "没有可导出的 MTR 结果！")
+            return
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialfile=f"mtr_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(self.scanner.get_summary_text())
+                    f.write("\n\n---------- 运行日志 ----------\n")
+                    f.write(self.log_text.get('1.0', tk.END))
+                messagebox.showinfo("导出成功", f"报告已保存到:\n{filename}")
+            except Exception as e:
+                messagebox.showerror("导出失败", f"导出时发生错误:\n{e}")
+
+    def copy_results(self):
+        if not self.scanner or not self.scanner.hops:
+            messagebox.showwarning("警告", "没有可复制的结果！")
+            return
+        text = self.scanner.get_summary_text()
+        try:
+            self.frame.clipboard_clear()
+            self.frame.clipboard_append(text)
+            messagebox.showinfo("复制成功", "结果已复制到剪贴板")
+        except Exception as e:
+            messagebox.showerror("复制失败", f"复制时发生错误:\n{e}")
+
+
 def main():
     root = tk.Tk()
     root.title("NetKit - 网络工具箱")
@@ -1861,6 +2817,8 @@ def main():
     notebook.add(scanner_frame, text="端口扫描")
     nmap_frame = ttk.Frame(notebook)
     notebook.add(nmap_frame, text="Nmap扫描")
+    mtr_frame = ttk.Frame(notebook)
+    notebook.add(mtr_frame, text="MTR路由追踪")
     subnet_frame = ttk.Frame(notebook)
     notebook.add(subnet_frame, text="子网掩码计算")
     ipgeo_frame = ttk.Frame(notebook)
@@ -1868,6 +2826,8 @@ def main():
     scanner_app = PortScannerGUI(scanner_frame, embedded=True, results_page=results_app)
     nmap_app = NmapScanGUI(nmap_frame)
     nmap_app.set_root(root)
+    mtr_app = MTRScanGUI(mtr_frame)
+    mtr_app.set_root(root)
     subnet_app = SubnetCalculatorGUI(subnet_frame)
     ipgeo_app = IPGeolocationGUI(ipgeo_frame)
     root.update_idletasks()
