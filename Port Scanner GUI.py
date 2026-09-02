@@ -191,7 +191,7 @@ class PortScanner:
         ports_to_scan = self.custom_ports if self.custom_ports else list(range(self.start_port, self.end_port + 1))
         self.total_ports = len(ports_to_scan)
         self.scanned_ports = 0
-        for port in ports_to_scan: self.queue.put(port)
+        for port in ports_to_scan: self.queue.put(port)git commit -m "第一次上传：初始化项目"
         thread_list = []
         for _ in range(self.threads):
             thread = threading.Thread(target=self.worker)
